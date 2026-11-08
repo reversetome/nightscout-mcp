@@ -737,7 +737,21 @@ async def health(_request: Request) -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
+def _startup_report() -> None:
+    """One line in the host's logs saying whether writing is on. Names only —
+    never a value — so it is safe in any log sink."""
+    if NS_WRITE_TOKEN:
+        state = "ENABLED"
+    elif "NS_WRITE_TOKEN" in os.environ:
+        state = "disabled (NS_WRITE_TOKEN is set but empty)"
+    else:
+        state = "disabled (NS_WRITE_TOKEN not set)"
+    ns_keys = sorted(k for k in os.environ if k.upper().startswith("NS"))
+    print(f"nightscout-mcp: log_treatment {state}; NS* env keys: {', '.join(ns_keys) or '-'}", flush=True)
+
+
 def main():
+    _startup_report()
     app = mcp.http_app(middleware=[Middleware(BearerAuth)])
     import uvicorn
 
