@@ -95,7 +95,27 @@ one it doesn't, and it's the kind of thing a model is good at picking out of
 two weeks of readings. Hours are binned in your Nightscout profile's own
 timezone, so 3am means your 3am.
 
-There are no write tools. The server cannot change anything in Nightscout.
+By default there are no write tools and the server cannot change anything in
+Nightscout.
+
+### Optional: `log_treatment` (append-only)
+
+If — and only if — `NS_WRITE_TOKEN` is set, one extra tool appears so you can
+say "I took 6u NovoRapid at 19:30" and have it recorded:
+
+- **Append only.** It creates insulin and/or carb records. It cannot edit or
+  delete anything, and it cannot send profile switches or temporary targets —
+  the event types a looping app may act on.
+- **Records, not doses.** It logs what already happened; it never doses and
+  never suggests an amount.
+- **Guard rails.** 0.5–25 u in 0.5 steps, 1–250 g, a time within the past
+  24 h (never the future), a refusal if a matching record exists within
+  ±10 minutes, and at most 12 writes per hour.
+- **Separate credential.** Use its own subject with the `careportal` role, so
+  deleting that subject turns writing off without breaking reads.
+
+Records are tagged `enteredBy: Claude (nightscout-mcp)`. If you loop with a
+pump, think twice: an app that accepts carbs from Nightscout may act on them.
 
 ### Deliberately not exposed
 
@@ -114,8 +134,9 @@ deliberately strict:
   There is no "unauthenticated if you forget the variable" mode — that is the
   failure a deployment never notices.
 - **Least privilege upstream.** It reads Nightscout with a *readable* access
-  token, never the admin `API_SECRET`. Even a total compromise of this server
-  cannot write to your Nightscout.
+  token, never the admin `API_SECRET`. Unless you opt in with
+  `NS_WRITE_TOKEN`, even a total compromise of this server cannot write to
+  your Nightscout; with it, the most it can do is append treatment records.
 - **Constant-time token comparison**, so response timing can't be used to
   recover the bearer a character at a time.
 - **Errors are sanitised.** Nightscout authenticates by query parameter, so the
