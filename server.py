@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Read-only Nightscout MCP server.
+Nightscout MCP server — read-only by default, with one optional,
+append-only write tool.
 
 Exposes glucose, treatments, profile and device status from a Nightscout
 instance to MCP clients (e.g. the Claude apps) over HTTP.
@@ -11,27 +12,36 @@ Security model:
     the public internet, and an unset environment variable must not be the
     difference between authenticated and open.
   - Nightscout is read with a least-privilege *readable* access token
-    (NS_TOKEN), never the admin API_SECRET. There are no write tools here, so
-    by construction it can only ever read.
+    (NS_TOKEN), never the admin API_SECRET.
+  - Writing is OFF unless NS_WRITE_TOKEN is set. When it is, exactly one tool
+    is registered: `log_treatment`, which can only APPEND an insulin and/or
+    carb record. There is no update, no delete, and no way to send profile
+    switches or temporary targets — the event types a looping app (AAPS,
+    Loop) may act on. The write token should be a separate subject with the
+    `careportal` role, so writing can be revoked without breaking reads.
   - The Nightscout token travels as a query parameter (Nightscout's own API
     convention), so upstream errors are sanitised before they surface — an
     unsanitised httpx error embeds the full request URL, token included, into
     logs and client-visible messages.
 
 Env:
-  NS_URL       required   e.g. https://your-nightscout.example.com
-  NS_TOKEN     optional   Nightscout readable access token (subject-<hex>)
-  MCP_BEARER   required   bearer token callers must present
-  PORT         optional   listen port (default 8787)
-  NS_UNITS     optional   mg/dl (default) or mmol -- display unit for stats
+  NS_URL          required   e.g. https://your-nightscout.example.com
+  NS_TOKEN        optional   Nightscout readable access token (subject-<hex>)
+  NS_WRITE_TOKEN  optional   careportal-role token; enables log_treatment
+  MCP_BEARER      required   bearer token callers must present
+  PORT            optional   listen port (default 8787)
+  NS_UNITS        optional   mg/dl (default) or mmol -- display unit for stats
   TRUSTED_PROXY_IPS  optional  see main()
 """
 import hmac
 import json
 import os
 import statistics
+import time
+from collections import deque
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -44,6 +54,10 @@ from starlette.responses import JSONResponse
 
 NS_URL = os.environ["NS_URL"].rstrip("/")
 NS_TOKEN = os.environ.get("NS_TOKEN", "")
+# Unset (the default) means no write tool exists at all — not "exists and
+# fails". A tool the model can see invites calls; one it cannot see cannot be
+# talked into anything.
+NS_WRITE_TOKEN = os.environ.get("NS_WRITE_TOKEN", "")
 
 # Required, and deliberately so.
 #
@@ -97,6 +111,35 @@ async def _ns_get(path: str, params: dict | None = None) -> object:
             return r.json()
         except ValueError:
             raise RuntimeError(f"Nightscout returned non-JSON for {path}") from None
+
+
+async def _ns_post_treatment(doc: dict) -> object:
+    """POST one treatment with the write token, errors sanitised as in _ns_get.
+
+    Hard-wired to /api/v1/treatments on purpose: there is no generic POST
+    helper in this module, so no future tool can reuse it to reach profiles,
+    entries or devicestatus by accident.
+    """
+    async with httpx.AsyncClient(timeout=20) as c:
+        try:
+            r = await c.post(
+                f"{NS_URL}/api/v1/treatments",
+                params={"token": NS_WRITE_TOKEN},
+                json=doc,
+            )
+        except httpx.RequestError as exc:
+            raise RuntimeError(f"Nightscout write failed: {type(exc).__name__}") from None
+        if r.status_code in (401, 403):
+            raise RuntimeError(
+                f"Nightscout refused the write ({r.status_code}) — NS_WRITE_TOKEN "
+                "needs a subject with the careportal role"
+            ) from None
+        if r.status_code >= 400:
+            raise RuntimeError(f"Nightscout returned {r.status_code} for the write") from None
+        try:
+            return r.json()
+        except ValueError:
+            return None
 
 
 # ---- bearer auth gate (everything except /health) -------------------------
@@ -445,6 +488,177 @@ async def compare_periods(days: int = 7) -> dict:
             )
         },
     }
+
+
+# ---- optional append-only write tool ---------------------------------------
+#
+# Registered only when NS_WRITE_TOKEN is set (see the bottom of this block).
+# Every limit below exists because the record lands in the same treatments
+# collection a looping app reads to compute insulin-on-board: a wrong entry is
+# not a cosmetic error there.
+INSULIN_MIN, INSULIN_MAX = 0.5, 25.0   # units; pen doses, recorded not dosed
+CARBS_MIN, CARBS_MAX = 1, 250          # grams
+MAX_AGE = timedelta(hours=24)          # backfilling further than this is a job for a human
+FUTURE_SKEW = timedelta(minutes=5)     # tolerate clock drift, refuse the future
+DUP_WINDOW = timedelta(minutes=10)     # "did I already log that?" radius
+WRITES_PER_HOUR = 12                   # a person logs a handful; a loop logs hundreds
+_ENTERED_BY = "Claude (nightscout-mcp)"
+_write_times: deque[float] = deque()
+
+
+def _parse_when(when: str | None, tz, now: datetime) -> datetime:
+    """Turn the caller's time into an aware UTC datetime.
+
+    Accepts ISO 8601 (with or without offset; naive means the Nightscout
+    profile's local time), 'YYYY-MM-DD HH:MM' local, or bare 'HH:MM' meaning
+    its most recent past occurrence — said at 01:00, "23:00" is last night,
+    not tonight.
+    """
+    if not when or not when.strip():
+        return now
+    s = when.strip()
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=tz)
+        return dt.astimezone(timezone.utc)
+    except ValueError:
+        pass
+    try:
+        hm = datetime.strptime(s, "%H:%M")
+    except ValueError:
+        raise ValueError(
+            "`at` must be 'YYYY-MM-DD HH:MM' (local), 'HH:MM', or ISO 8601"
+        ) from None
+    local_now = now.astimezone(tz)
+    cand = local_now.replace(hour=hm.hour, minute=hm.minute, second=0, microsecond=0)
+    if cand - local_now > FUTURE_SKEW:
+        cand -= timedelta(days=1)
+    return cand.astimezone(timezone.utc)
+
+
+def _iso_ms(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+
+
+async def log_treatment(
+    insulin_units: float | None = None,
+    insulin_name: Literal["NovoRapid", "Fiasp", "Other"] | None = None,
+    carbs_g: float | None = None,
+    at: str | None = None,
+    notes: str | None = None,
+    allow_duplicate: bool = False,
+) -> dict:
+    """Append an insulin and/or carb RECORD to Nightscout. Writes nothing else.
+
+    A record of something that already happened — it doses nothing. Call it
+    only when the user has said, in their own words, that they took this
+    insulin or ate these carbs, and read the exact entry back to them first.
+    Never call it on your own estimate alone or to "fix" existing data; it
+    cannot edit or delete, and a wrong record skews insulin-on-board in apps
+    such as AAPS.
+
+    Args:
+      insulin_units: 0.5–25 in 0.5 steps.
+      insulin_name: which insulin (NovoRapid / Fiasp / Other); kept in notes.
+      carbs_g: 1–250.
+      at: when it happened, in the Nightscout profile's local time:
+          'YYYY-MM-DD HH:MM', or 'HH:MM' (its most recent past occurrence),
+          or ISO 8601 with offset. Omit for "now". Must be within 24 h.
+      notes: optional, up to 200 characters (e.g. "high-fat meal").
+      allow_duplicate: a matching record within ±10 min is refused unless
+          this is true — set it only after the user confirms both are real.
+    """
+    if insulin_units is None and carbs_g is None:
+        raise ValueError("give insulin_units, carbs_g, or both")
+    if insulin_units is not None:
+        if not (INSULIN_MIN <= insulin_units <= INSULIN_MAX):
+            raise ValueError(f"insulin_units must be {INSULIN_MIN}–{INSULIN_MAX}")
+        if abs(insulin_units * 2 - round(insulin_units * 2)) > 1e-9:
+            raise ValueError("insulin_units must be in 0.5-unit steps")
+    if carbs_g is not None:
+        if not (CARBS_MIN <= carbs_g <= CARBS_MAX):
+            raise ValueError(f"carbs_g must be {CARBS_MIN}–{CARBS_MAX}")
+        carbs_g = round(carbs_g, 1)
+    notes = (notes or "").strip()
+    if len(notes) > 200:
+        raise ValueError("notes must be 200 characters or fewer")
+
+    tz = await _local_tz()
+    now = datetime.now(timezone.utc)
+    when = _parse_when(at, tz, now)
+    if when - now > FUTURE_SKEW:
+        raise ValueError("that time is in the future — only past events can be recorded")
+    if now - when > MAX_AGE:
+        raise ValueError("that is more than 24 hours ago — enter it in AAPS/Nightscout directly")
+
+    mono = time.monotonic()
+    while _write_times and mono - _write_times[0] > 3600:
+        _write_times.popleft()
+    if len(_write_times) >= WRITES_PER_HOUR:
+        raise RuntimeError(f"write limit reached ({WRITES_PER_HOUR}/hour); try again later")
+
+    # Duplicate guard. Fails closed: if we cannot read, we do not write.
+    nearby = await _ns_get(
+        "/api/v1/treatments.json",
+        {
+            "count": 200,
+            "find[created_at][$gte]": _iso_ms(when - DUP_WINDOW),
+            "find[created_at][$lte]": _iso_ms(when + DUP_WINDOW),
+        },
+    )
+    dups = [
+        {"time": x.get("created_at"), "insulin": x.get("insulin"), "carbs": x.get("carbs")}
+        for x in (nearby or [])
+        if (insulin_units is not None and abs((x.get("insulin") or 0) - insulin_units) < 0.01)
+        or (carbs_g is not None and abs((x.get("carbs") or 0) - carbs_g) < 0.05)
+    ]
+    if dups and not allow_duplicate:
+        return {
+            "status": "refused_possible_duplicate",
+            "message": "a matching record already exists within ±10 minutes; nothing was written",
+            "existing": dups,
+        }
+
+    local = when.astimezone(tz)
+    base = {
+        "created_at": _iso_ms(when),
+        "date": int(when.timestamp() * 1000),
+        "utcOffset": int((local.utcoffset() or timedelta()).total_seconds() // 60),
+        "enteredBy": _ENTERED_BY,
+    }
+    note_text = " · ".join(p for p in (insulin_name if insulin_units is not None else None, notes) if p)
+    # One record per item, eventType "Meal Bolus" — the same shape AAPS itself
+    # uploads, so it is read back the same way.
+    docs = []
+    if insulin_units is not None:
+        docs.append({**base, "eventType": "Meal Bolus", "insulin": insulin_units, "notes": note_text})
+    if carbs_g is not None:
+        docs.append({**base, "eventType": "Meal Bolus", "carbs": carbs_g, "notes": notes})
+
+    created = await _ns_post_treatment(docs if len(docs) > 1 else docs[0])
+    _write_times.append(mono)
+    created_list = created if isinstance(created, list) else ([created] if created else [])
+    return {
+        "status": "logged",
+        "time_local": local.strftime("%Y-%m-%d %H:%M"),
+        "timezone": str(tz),
+        "records": [
+            {
+                "id": c.get("_id") if isinstance(c, dict) else None,
+                "insulin": d.get("insulin"),
+                "carbs": d.get("carbs"),
+                "notes": d.get("notes"),
+            }
+            for c, d in zip(created_list or [{}] * len(docs), docs)
+        ],
+        "reminder": "record only — nothing was dosed",
+    }
+
+
+if NS_WRITE_TOKEN:
+    mcp.tool(log_treatment)
+
 
 # ---- interactive dashboard (MCP Apps) --------------------------------------
 #
